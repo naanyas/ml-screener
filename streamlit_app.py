@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import yfinance as yf
 import concurrent.futures
@@ -8,6 +9,7 @@ import plotly.graph_objs as go
 import math
 import random
 import re
+import json
 
 # === NEW: external data helpers ===
 import requests
@@ -1412,6 +1414,98 @@ def trigger_audio_alert(symbol: str, reason: str):
     st.warning(f"🔔 {symbol}: {reason}")
 
 
+def browser_notification_component(pending_alerts: list[dict]) -> str:
+    """HTML+JS for an iframe component that:
+      1. Renders a one-click button to grant Notification permission
+      2. Shows current permission status
+      3. Fires native OS notifications for any pending alerts in this scan,
+         deduped per-symbol-per-calendar-day via localStorage so a stuck
+         alert doesn't re-fire on every auto-refresh.
+
+    Uses st.components.v1.html (an iframe), not st.markdown — Streamlit
+    strips <script> from markdown for security, so the JS would not run.
+    """
+    # Defensive against unusual chars in scraped data, though stock
+    # tickers shouldn't contain </script> in practice.
+    alerts_json = json.dumps(pending_alerts).replace("</", "<\\/")
+    return f"""
+    <div style="display:flex;align-items:center;gap:10px;
+                padding:8px 12px;background:#f7f7f9;border-radius:6px;
+                font-family:system-ui,-apple-system,sans-serif;font-size:13px;
+                border:1px solid #e5e5e9;">
+      <button id="ml-notif-btn"
+              style="padding:6px 12px;border-radius:4px;cursor:pointer;
+                     border:1px solid #888;background:#fff;font-size:13px;">
+        🔔 Enable Browser Notifications
+      </button>
+      <span id="ml-notif-status" style="color:#666;"></span>
+    </div>
+    <script>
+    (function() {{
+      const PENDING = {alerts_json};
+      const btn = document.getElementById('ml-notif-btn');
+      const stat = document.getElementById('ml-notif-status');
+
+      function refresh() {{
+        if (!('Notification' in window)) {{
+          stat.textContent = 'not supported in this browser';
+          btn.disabled = true;
+          return;
+        }}
+        const p = Notification.permission;
+        if (p === 'granted') {{
+          stat.textContent = '✓ enabled — alerts go to your OS notification center';
+          stat.style.color = '#2a7';
+          btn.textContent = '🔔 Notifications enabled';
+          btn.style.background = '#e8f7ee';
+        }} else if (p === 'denied') {{
+          stat.textContent = '✗ blocked by browser — re-enable in site settings';
+          stat.style.color = '#c33';
+        }} else {{
+          stat.textContent = 'click once to enable (browser will ask)';
+        }}
+      }}
+      refresh();
+
+      btn.addEventListener('click', function() {{
+        Notification.requestPermission().then(function(p) {{
+          refresh();
+          if (p === 'granted') {{
+            new Notification('ML Screener', {{
+              body: "You'll get a ping here when symbols cross your alert thresholds.",
+            }});
+          }}
+        }});
+      }});
+
+      if ('Notification' in window && Notification.permission === 'granted') {{
+        // Per-calendar-day dedup so reopening the tab during the day
+        // doesn't re-fire every notification on the first scan.
+        let fired;
+        try {{
+          fired = JSON.parse(localStorage.getItem('mlscreener_fired') || '{{}}');
+        }} catch(e) {{ fired = {{}}; }}
+        const today = new Date().toISOString().slice(0, 10);
+        if (fired.date !== today) {{
+          fired = {{date: today, symbols: {{}}}};
+        }}
+        for (const a of PENDING) {{
+          if (!fired.symbols[a.symbol]) {{
+            new Notification('🔥 ' + a.symbol + ' — ML Screener', {{
+              body: a.reason,
+              tag: 'mlscreener-' + a.symbol,
+              requireInteraction: false,
+            }});
+            fired.symbols[a.symbol] = Date.now();
+          }}
+        }}
+        localStorage.setItem('mlscreener_fired', JSON.stringify(fired));
+      }}
+    }})();
+    </script>
+    """
+
+
 # ========================= MAIN DISPLAY =========================
 with st.spinner("Scanning (10-day momentum, V12 hybrid universe)…"):
     if use_last_results and "last_df" in st.session_state:
@@ -1546,6 +1640,33 @@ else:
         )
 
         st.subheader(f"🔥 10-Day Momentum Board (V12) — {len(df)} symbols")
+
+        # Pre-scan: collect symbols crossing alert thresholds this scan that
+        # haven't already fired in this Python session. This list drives the
+        # browser-notification component. The inline row loop below still
+        # fires the audio + yellow banner alerts (additive, not replacement).
+        pending_browser_alerts: list[dict] = []
+        if enable_alerts:
+            for _, row in df.iterrows():
+                sym = row["Symbol"]
+                if sym in st.session_state.alerted:
+                    continue
+                reason = None
+                if row["Score"] is not None and row["Score"] >= ALERT_SCORE_THRESHOLD:
+                    reason = f"Score {row['Score']}"
+                elif row["PM%"] is not None and row["PM%"] >= ALERT_PM_THRESHOLD:
+                    reason = f"Premarket {row['PM%']}%"
+                elif row["VWAP%"] is not None and row["VWAP%"] >= ALERT_VWAP_THRESHOLD:
+                    reason = f"VWAP Dist {row['VWAP%']}%"
+                if reason:
+                    pending_browser_alerts.append({"symbol": sym, "reason": reason})
+
+        # Always render the component (even with no pending alerts) so the
+        # permission button stays visible and the user can grant access.
+        components.html(
+            browser_notification_component(pending_browser_alerts),
+            height=60,
+        )
 
         if enable_alerts and st.session_state.alerted:
             alerted_list = ", ".join(sorted(st.session_state.alerted))
