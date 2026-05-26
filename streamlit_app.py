@@ -65,7 +65,10 @@ def get_finviz_news_for_ticker(ticker: str, max_items: int = 12):
     et_tz = pytz.timezone("US/Eastern")
     et_now = datetime.now(et_tz)
     today_date = et_now.date()
-    today_str = et_now.strftime("%b-%d-%y")  # e.g., "Dec-06-25"
+
+    # Finviz only stamps the FIRST row of each date block with a date; later
+    # rows show only the time and inherit the most recent date above them.
+    current_date = None
 
     for row in rows[:max_items]:
         tds = row.find_all("td")
@@ -77,38 +80,20 @@ def get_finviz_news_for_ticker(ticker: str, max_items: int = 12):
         if not headline_tag:
             continue
 
-        # Finviz timestamp formats:
-        # - First row of a date block: "Dec-06-25 09:21AM"
-        # - Subsequent rows same day: "09:21AM"
         parts = time_text.split()
         if len(parts) >= 2 and "-" in parts[0]:
-            # Has an explicit date (e.g. "Dec-06-25 09:21AM")
-            date_part_str = parts[0]
-            time_part_str = parts[1]
+            try:
+                current_date = datetime.strptime(parts[0], "%b-%d-%y").date()
+            except Exception:
+                continue
         else:
-            # Only time – implied today
-            date_part_str = today_str
-            time_part_str = parts[0] if parts else "12:00AM"
-
-        # Parse date
-        try:
-            date_only = datetime.strptime(date_part_str, "%b-%d-%y").date()
-        except Exception:
-            continue
+            # Time-only row — drop if we haven't yet seen a dated row above it
+            if current_date is None:
+                continue
 
         # Filter by calendar date (today only)
-        if date_only != today_date:
+        if current_date != today_date:
             continue
-
-        # Parse time to build full datetime in US/Eastern
-        try:
-            dt_time = datetime.strptime(time_part_str, "%I:%M%p").time()
-            dt_et = et_tz.localize(datetime.combine(date_only, dt_time))
-        except Exception:
-            dt_et = et_now  # fallback
-
-        age_minutes = (et_now - dt_et).total_seconds() / 60.0
-        breaking_flag = age_minutes >= 0 and age_minutes <= 20  # < 20 minutes old
 
         title = headline_tag.get_text(strip=True)
         news_url = "https://finviz.com/" + headline_tag["href"].lstrip("/")
@@ -161,7 +146,6 @@ def get_finviz_news_for_ticker(ticker: str, max_items: int = 12):
                 "title": title,
                 "sent": sentiment,
                 "url": news_url,
-                "breaking": breaking_flag,
             }
         )
 
@@ -272,6 +256,13 @@ DEFAULT_MAX_PRICE = 5.0
 DEFAULT_MIN_VOLUME = 100_000
 DEFAULT_MIN_BREAKOUT = 0.0
 
+# A Finviz headline is flagged as NEW/breaking only if this session first
+# observed its URL within this many seconds. Anchors "new" to our scan time
+# rather than Finviz's publish timestamp, so stale Friday news doesn't fire
+# a fresh badge on Monday and we don't badge a headline whose price has
+# already moved.
+BREAKING_WINDOW_SECONDS = 180
+
 # NEW: TSX symbol list (Canada)
 TSX_INSTRUMENTS_URL = (
     "https://github.com/LondonMarket/Global-Stock-Symbols/raw/main/"
@@ -294,6 +285,16 @@ if "seed_universe_size" not in st.session_state:
     st.session_state.seed_universe_size = 0
 if "seed_universe_mode" not in st.session_state:
     st.session_state.seed_universe_mode = None
+
+# Tracks {url: datetime first observed by this session}.
+# Used to decide which headlines deserve the NEW badge.
+if "first_seen_finviz_urls" not in st.session_state:
+    st.session_state.first_seen_finviz_urls = {}
+# The first Finviz pass of a session has no history to compare against, so
+# every headline would otherwise appear "new". We seed the dict on that
+# pass and only badge new arrivals on subsequent passes.
+if "finviz_warmup_done" not in st.session_state:
+    st.session_state.finviz_warmup_done = False
 
 # ========================= AUTO REFRESH (V11 streaming aware) =========================
 if st.session_state.auto_refresh_enabled:
@@ -1323,7 +1324,10 @@ if df_raw.empty:
 else:
     # --- FINVIZ PER-TICKER NEWS + AUTO-SEED ---
     finviz_cache: dict[str, list[dict]] = {}
-    now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_utc = datetime.now(timezone.utc)
+    now_utc_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    breaking_cutoff = now_utc - timedelta(seconds=BREAKING_WINDOW_SECONDS)
+    is_warmup_pass = not st.session_state.finviz_warmup_done
 
     seed_map = {entry["Symbol"]: entry for entry in st.session_state.seed_universe}
 
@@ -1332,6 +1336,27 @@ else:
             items = get_finviz_news_for_ticker(sym)
         except Exception:
             items = []
+
+        # Mark each item's `breaking` flag based on when THIS session first
+        # observed the URL — not the headline's publish timestamp. Fixes the
+        # "stale Friday headline shows as <20m old on Monday" problem.
+        for item in items:
+            url = item.get("url")
+            if not url:
+                item["breaking"] = False
+                continue
+            first_seen = st.session_state.first_seen_finviz_urls.get(url)
+            if first_seen is None:
+                if is_warmup_pass:
+                    # Seed history without firing badges on the first pass.
+                    st.session_state.first_seen_finviz_urls[url] = breaking_cutoff
+                    item["breaking"] = False
+                else:
+                    st.session_state.first_seen_finviz_urls[url] = now_utc
+                    item["breaking"] = True
+            else:
+                item["breaking"] = first_seen > breaking_cutoff
+
         finviz_cache[sym] = items
 
         if items:
@@ -1352,6 +1377,7 @@ else:
                 seed_map[sym] = entry
 
     st.session_state.seed_universe_size = len(st.session_state.seed_universe)
+    st.session_state.finviz_warmup_done = True
 
     # Finviz presence, seed timestamp, and Finviz-based sentiment
     df_raw["FinvizNews"] = df_raw["Symbol"].map(lambda s: bool(finviz_cache.get(s)))
@@ -1433,7 +1459,7 @@ else:
             c1.markdown(f"**{sym}** ({row['Exchange']})")
 
             if has_finviz and has_breaking:
-                c1.markdown("🔥 **BREAKING Finviz News (<20m)**")
+                c1.markdown("🆕 **NEW Finviz Headline (just landed)**")
             elif has_finviz:
                 c1.markdown("🔥 **Finviz Catalyst (Today)**")
             else:
@@ -1587,7 +1613,7 @@ else:
                     st.write("No Finviz headlines today for this ticker.")
                 else:
                     for n in finviz_items:
-                        badge = "🔥 BREAKING • " if n.get("breaking") else ""
+                        badge = "🆕 NEW • " if n.get("breaking") else ""
                         st.markdown(
                             f"{n['sent']} {badge}"
                             f"[{n['title']}]({n['url']})  \n"
