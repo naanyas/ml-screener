@@ -655,6 +655,20 @@ def build_universe(
 
 
 # ========================= SCORING (10-DAY MODEL) =========================
+def _capped_signed(value, cap_pos, cap_neg, pos_w, neg_w):
+    """Apply asymmetric caps + weights to a signed momentum value.
+
+    Bounds the contribution so a single outlier (e.g. a 500% premarket
+    runner) can't dominate the score, and preserves negative information
+    so a crashing stock no longer scores the same as a flat one.
+    """
+    if value is None:
+        return 0.0
+    if value >= 0:
+        return min(value, cap_pos) * pos_w
+    return max(value, -cap_neg) * neg_w
+
+
 def short_window_score(
     pm,
     yday,
@@ -670,7 +684,9 @@ def short_window_score(
     vwap_enabled=True,
 ):
     """
-    Short-window breakout score.
+    Short-window breakout score. All momentum terms are capped so the
+    output stays on a comparable scale across days and across the
+    penny-stock outliers this scanner targets.
     """
     score = 0.0
 
@@ -678,20 +694,19 @@ def short_window_score(
     m10_w = 0.3 if preopen_mode else 0.6
     rvol_w = 2.6 if preopen_mode else 2.0
 
-    if pm is not None:
-        score += max(pm, 0) * pm_w
-    if yday is not None:
-        score += max(yday, 0) * 0.8
-    if m3 is not None:
-        score += max(m3, 0) * 1.2
-    if m10 is not None:
-        score += max(m10, 0) * m10_w
+    # Momentum terms: positives capped, negatives penalized at half-weight.
+    score += _capped_signed(pm,   cap_pos=30, cap_neg=15, pos_w=pm_w,  neg_w=pm_w * 0.5)
+    score += _capped_signed(yday, cap_pos=20, cap_neg=10, pos_w=0.8,   neg_w=0.4)
+    score += _capped_signed(m3,   cap_pos=30, cap_neg=15, pos_w=1.2,   neg_w=0.6)
+    score += _capped_signed(m10,  cap_pos=50, cap_neg=25, pos_w=m10_w, neg_w=m10_w * 0.5)
 
+    # RSI(7) bonus capped at RSI 72 — past that it's overbought, not stronger.
     if rsi7 is not None and rsi7 > 55:
-        score += (rsi7 - 55) * 0.4
+        score += min(rsi7 - 55, 17) * 0.4
 
+    # RVOL bonus capped at 5x avg (anything beyond is already extreme).
     if rvol10 is not None and rvol10 > 1.2:
-        score += (rvol10 - 1.2) * rvol_w
+        score += min(rvol10 - 1.2, 3.8) * rvol_w
 
     if vwap_enabled and vwap is not None and vwap > 0:
         score += min(vwap, 6) * 1.5
@@ -707,13 +722,19 @@ def short_window_score(
     return round(score, 2)
 
 
-def ml_breakout_probability(score: float, rvol10, pm, m10) -> float:
+def momentum_index(score: float, rvol10, pm, m10) -> float:
     """
-    'ML-style' probability-like number, using a richer feature mix
-    but kept lightweight (no external libraries).
+    0-100 momentum index. NOT a probability — just a smoothed, bounded
+    transform of the breakout score and key confirming factors. Higher
+    means stronger momentum profile.
+
+    Renamed from ml_breakout_probability: the old name implied a
+    statistical likelihood that was never trained or calibrated. The
+    denominator is now sized to the post-cap score range so the index
+    actually spreads across 0-100 instead of saturating above ~score 50.
     """
     try:
-        base = score / 25.0
+        base = score / 80.0
         if rvol10 is not None:
             base += (rvol10 - 1.0) * 0.15
         if pm is not None:
@@ -721,8 +742,8 @@ def ml_breakout_probability(score: float, rvol10, pm, m10) -> float:
         if m10 is not None:
             base += (m10 / 50.0) * 0.1
 
-        prob = 1 / (1 + math.exp(-base))
-        return round(prob * 100, 1)
+        idx = 1 / (1 + math.exp(-base))
+        return round(idx * 100, 1)
     except Exception:
         return None
 
@@ -887,19 +908,74 @@ def entry_confidence_score(vwap_dist, rvol10, flow_bias) -> float:
     return round(max(0.0, min(100.0, score)), 1)
 
 
-def breakout_confirmation_index(score, rvol10, pm, m10) -> float:
+def breakout_confirmation_index(
+    last_price,
+    hist_close,
+    hist_volume,
+    intra_volume_today,
+    vwap_dist,
+) -> float:
     """
-    Breakout confirmation index 0–100 combining score, RVOL, PM, and 10D trend.
-    """
-    base = (score or 0) / 2.0
-    if rvol10 is not None:
-        base += max(0.0, (rvol10 - 1.0) * 8.0)
-    if pm is not None:
-        base += max(0.0, pm) * 1.2
-    if m10 is not None and m10 > 0:
-        base += min(m10, 30) * 0.8
+    0-100 breakout confirmation built from features that are NOT already
+    inside `short_window_score`, so it's a genuine second opinion rather
+    than a rescaled echo:
 
-    return round(max(0.0, min(100.0, base)), 1)
+      - Proximity to / breach of the prior 10-day high (price structure)
+      - Today's intraday volume vs YESTERDAY's full-day volume (a raw
+        burst signal, not the smoothed 10-day RVOL the score already uses)
+      - Currently holding above intraday VWAP
+
+    Returns None when there's too little data to evaluate.
+    """
+    if hist_close is None or len(hist_close) < 2 or last_price is None:
+        return None
+
+    score = 50.0  # neutral baseline
+
+    # 1. Proximity to / breach of the prior 10-day high (excluding today)
+    try:
+        max_prior = float(hist_close.iloc[:-1].max())
+    except Exception:
+        max_prior = None
+    if max_prior and max_prior > 0:
+        breakout_pct = (last_price - max_prior) / max_prior * 100
+        if breakout_pct > 2:
+            score += 25       # clear breakout above the range
+        elif breakout_pct > 0:
+            score += 15       # marginal breakout
+        elif breakout_pct > -2:
+            score += 8        # coiling just under the high
+        elif breakout_pct > -5:
+            score -= 5
+        else:
+            score -= 15       # well below the recent ceiling
+
+    # 2. Today's intraday volume vs yesterday's full-day volume (raw burst,
+    #    no 10-day smoothing — independent of the score's RVOL term)
+    if intra_volume_today is not None and hist_volume is not None and len(hist_volume) >= 2:
+        try:
+            yday_vol = float(hist_volume.iloc[-2])
+        except Exception:
+            yday_vol = 0.0
+        if yday_vol > 0:
+            burst = intra_volume_today / yday_vol
+            if burst > 1.5:
+                score += 15
+            elif burst > 1.0:
+                score += 8
+            elif burst < 0.5:
+                score -= 8
+
+    # 3. Currently holding above intraday VWAP
+    if vwap_dist is not None:
+        if vwap_dist > 1:
+            score += 10
+        elif vwap_dist > -0.5:
+            score += 5
+        else:
+            score -= 10
+
+    return round(max(0.0, min(100.0, score)), 1)
 
 
 # ========================= SIMPLE AI COMMENTARY =========================
@@ -1003,6 +1079,11 @@ def scan_one(
         except Exception:
             intra = None
 
+        # Latest intraday close — used as the "current price" reference for
+        # the VWAP comparison below. Defaults to the daily close so the
+        # downstream code still has a value when intraday data is missing.
+        last_intraday_close = price
+
         if intra is not None and not intra.empty and len(intra) >= 3:
             iclose = intra["Close"]
             iopen = intra["Open"]
@@ -1011,6 +1092,7 @@ def scan_one(
             live_intraday_volume = float(ivol.sum())
 
             last_close = float(iclose.iloc[-1])
+            last_intraday_close = last_close
             prev_close_intraday = float(iclose.iloc[-2])
             if prev_close_intraday > 0:
                 premarket_pct = (last_close - prev_close_intraday) / prev_close_intraday * 100
@@ -1020,7 +1102,9 @@ def scan_one(
             if total_vol > 0:
                 vwap_val = float((typical_price * ivol).sum() / total_vol)
                 if vwap_val > 0:
-                    vwap_dist = (price - vwap_val) / vwap_val * 100
+                    # Compare the latest intraday tick (not yesterday's daily
+                    # close) to today's intraday VWAP.
+                    vwap_dist = (last_close - vwap_val) / vwap_val * 100
 
             of_df = intra[["Open", "Close", "Volume"]].dropna()
             if not of_df.empty:
@@ -1076,6 +1160,28 @@ def scan_one(
         avg10 = float(daily_volume.mean()) if len(daily_volume) > 0 else 0
         rvol10 = live_intraday_volume / avg10 if avg10 > 0 else None
 
+        # ATR — Average True Range, used downstream for volatility-scaled
+        # targets/stops. Uses up to 7 daily periods (we only have ~10 to
+        # begin with). Falls back to None if data is too thin.
+        atr = None
+        if len(hist) >= 3:
+            high = hist["High"]
+            low = hist["Low"]
+            prev_close_series = hist["Close"].shift(1)
+            tr = pd.concat(
+                [
+                    high - low,
+                    (high - prev_close_series).abs(),
+                    (low - prev_close_series).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            n_atr = min(7, len(tr.dropna()))
+            if n_atr >= 2:
+                atr_val = float(tr.dropna().iloc[-n_atr:].mean())
+                if atr_val > 0:
+                    atr = atr_val
+
         if enable_ofb_filter:
             if order_flow_bias is None or order_flow_bias < min_ofb:
                 return None
@@ -1128,10 +1234,16 @@ def scan_one(
             preopen_mode=preopen_mode,
             vwap_enabled=vwap_enabled_flag,
         )
-        prob_rise = ml_breakout_probability(score, rvol10, premarket_pct, m10)
+        mom_idx = momentum_index(score, rvol10, premarket_pct, m10)
 
         entry_conf = entry_confidence_score(vwap_dist, rvol10, order_flow_bias)
-        bci = breakout_confirmation_index(score, rvol10, premarket_pct, m10)
+        bci = breakout_confirmation_index(
+            last_price=last_intraday_close,
+            hist_close=close,
+            hist_volume=daily_volume,
+            intra_volume_today=live_intraday_volume,
+            vwap_dist=vwap_dist,
+        )
 
         # AI commentary text here still uses 0 sentiment; we will recompute with
         # Finviz sentiment in the display layer.
@@ -1156,7 +1268,8 @@ def scan_one(
             "Price": round(price, 2),
             "Volume": int(live_intraday_volume),
             "Score": score,
-            "Prob_Rise%": prob_rise,
+            "Momentum_Index": mom_idx,
+            "ATR": round(atr, 4) if atr is not None else None,
             "PM%": round(premarket_pct, 2) if premarket_pct is not None else None,
             "YDay%": round(yday_pct, 2) if yday_pct is not None else None,
             "3D%": round(m3, 2) if m3 is not None else None,
@@ -1472,7 +1585,7 @@ else:
             c1.write(f"💲 Price: {row['Price']}")
             c1.write(f"📊 Live Volume: {row['Volume']:,}")
             c1.write(f"🔥 Score: **{row['Score']}**")
-            c1.write(f"🤖 ML Prob_Rise: {row['Prob_Rise%']}%")
+            c1.write(f"📊 Momentum Index: {row['Momentum_Index']}/100")
             c1.write(f"{row['MTF_Trend']}")
             c1.write(f"Trend: {row['EMA10 Trend']}")
 
@@ -1484,6 +1597,7 @@ else:
             price_val = float(row["Price"])
             bci_val = row.get("Breakout_Confirm", 0.0)
             entry_val = row.get("Entry_Confidence", 0.0)
+            atr_val = row.get("ATR", None)
 
             try:
                 if bci_val is None or pd.isna(bci_val):
@@ -1494,20 +1608,36 @@ else:
                 bci_val = bci_val or 0.0
                 entry_val = entry_val or 0.0
 
-            ai_target = round(price_val * (1 + (bci_val / 250.0) + (entry_val / 400.0)), 2)
-            ai_stop = round(price_val * (1 - (1 - entry_val / 100.0) * 0.05), 2)
-
-            c1.write(f"🎯 AI Target: **${ai_target}**")
-            c1.write(f"🛑 AI Stop: **${ai_stop}**")
-
             try:
-                rr = (ai_target - price_val) / max(0.01, (price_val - ai_stop))
-                rr_text = f"{rr:.2f} : 1"
+                if atr_val is None or pd.isna(atr_val) or atr_val <= 0:
+                    atr_val = None
             except Exception:
-                rr = None
-                rr_text = "—"
+                atr_val = None
 
-            c1.write(f"📈 R:R: **{rr_text}**")
+            if atr_val is not None:
+                # ATR-scaled target/stop. Wider target with stronger
+                # breakout confirmation; tighter stop with higher entry
+                # confidence. Multipliers stay bounded so a high-confidence
+                # trade can't end up with a zero-distance stop.
+                target_mult = 1.5 + (bci_val / 100.0)            # 1.5x to 2.5x ATR
+                stop_mult = 1.5 - 0.5 * (entry_val / 100.0)      # 1.0x to 1.5x ATR
+                target_price = round(price_val + target_mult * atr_val, 2)
+                stop_price = round(max(price_val - stop_mult * atr_val, 0.01), 2)
+
+                c1.write(f"🎯 Target: **${target_price}** (≈ {target_mult:.2f}× ATR)")
+                c1.write(f"🛑 Stop: **${stop_price}** (≈ {stop_mult:.2f}× ATR)")
+
+                try:
+                    rr = (target_price - price_val) / max(0.01, (price_val - stop_price))
+                    rr_text = f"{rr:.2f} : 1"
+                except Exception:
+                    rr_text = "—"
+                c1.write(f"📈 R:R: **{rr_text}**")
+                c1.caption(f"ATR(≤7d) = {atr_val:.3f}")
+            else:
+                c1.write("🎯 Target: — (insufficient data for ATR)")
+                c1.write("🛑 Stop: —")
+                c1.write("📈 R:R: —")
 
             ai_expl_list = []
 
@@ -1544,8 +1674,8 @@ else:
                 elif flow < 0.4:
                     ai_expl_list.append("Sellers active — cautious stop placement.")
 
-            ai_target_expl = " ".join(ai_expl_list)
-            c1.markdown(f"🧠 **AI Target Rationale:** {ai_target_expl}")
+            target_rationale = " ".join(ai_expl_list)
+            c1.markdown(f"🧠 **Target Rationale:** {target_rationale}")
 
             c2.write(f"PM%: {row['PM%']}")
             c2.write(f"YDay%: {row['YDay%']}")
@@ -1642,7 +1772,7 @@ else:
                             "Price",
                             "Volume",
                             "Score",
-                            "Prob_Rise%",
+                            "Momentum_Index",
                             "PM%",
                             "10D%",
                             "RVOL_10D",
@@ -1650,6 +1780,7 @@ else:
                             "FlowBias",
                             "Breakout_Confirm",
                             "Entry_Confidence",
+                            "ATR",
                         ]
                     ],
                     use_container_width=True,
@@ -1661,7 +1792,8 @@ else:
             "Price",
             "Volume",
             "Score",
-            "Prob_Rise%",
+            "Momentum_Index",
+            "ATR",
             "PM%",
             "YDay%",
             "3D%",
